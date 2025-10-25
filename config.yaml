@@ -1,0 +1,15 @@
+# Slider mappings: 0-based index
+slider_mapping:
+  0: master
+  1: chrome.exe
+  2: spotify.exe
+
+invert_sliders: True
+
+# Arduino settings
+com_port: COM6
+baud_rate: 230400
+
+# Noise reduction (depends on hardware)
+noise_reduction: low
+
