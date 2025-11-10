@@ -49,8 +49,14 @@ int clamp(int v) {
   return v < 0 ? 0 : v > 1023 ? 1023 : v;
 }
 
+// ✅ Fixed: CR+LF line endings for Deej 0.9.10 compatibility
 void sendValues() {
-  Serial.printf("%d|%d|%d\n", values[0], values[1], values[2]);
+  Serial.print(values[0]);
+  Serial.print("|");
+  Serial.print(values[1]);
+  Serial.print("|");
+  Serial.print(values[2]);
+  Serial.print("\r\n");
 }
 
 // ===== OLED Displays =====
@@ -98,7 +104,7 @@ void displayFocusTimer() {
       timerCompleted = true;
       displayFocusTimer();
 
-      // 🔔 Trigger buzzer alert when timer ends
+      // 🔔 Buzzer alert when session ends
       for (int i = 0; i < 3; i++) {
         digitalWrite(BUZZER_PIN, HIGH);
         delay(100);
@@ -178,7 +184,7 @@ void setup() {
   pinMode(CLK_PIN, INPUT_PULLUP);
   pinMode(DT_PIN, INPUT_PULLUP);
   pinMode(SW_PIN, INPUT_PULLUP);
-  pinMode(BUZZER_PIN, OUTPUT);  // ✅ Buzzer pin setup
+  pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
   lastClkState = digitalRead(CLK_PIN);
@@ -242,7 +248,6 @@ void loop() {
     unsigned long now = millis();
 
     if (focusMode) {
-      // Double-press → go to set timer mode
       if (waitingForSecondPress && now - lastPressTime < 600) {
         waitingForSecondPress = false;
         focusTimerRunning = false;
@@ -255,7 +260,6 @@ void loop() {
         lastPressTime = now;
       }
     } else {
-      // Volume mode app switching
       activeSlot = (activeSlot + 1) % 3;
       displayActiveApp();
     }
@@ -299,6 +303,13 @@ void loop() {
       displayFocusTimer();
     else
       displayActiveApp();
+  }
+
+  // ===== Background Deej sync (heartbeat) =====
+  static unsigned long lastDeejUpdate = 0;
+  if (!focusMode && millis() - lastDeejUpdate > 100) {
+    sendValues();
+    lastDeejUpdate = millis();
   }
 
   // ===== Standby logic =====
