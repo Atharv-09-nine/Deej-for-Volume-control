@@ -4,33 +4,16 @@
 #define CLK_PIN 15
 #define DT_PIN 2
 #define SW_PIN 4
-#define BUZZER_PIN 12  // 🔔 Buzzer output pin
-
-int values[3] = {512, 512, 512};
-int activeSlot = 0;
-const char* appNames[3] = {"Master", "Chrome", "Spotify"};
-
-bool lastButton = HIGH;
-unsigned long buttonPressTime = 0;
-bool buttonHeld = false;
-
-unsigned long lastActivity = 0;
-const unsigned long STANDBY_TIMEOUT = 8000;
-bool inStandby = false;
+#define BUZZER_PIN 12
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
-int eyeSize = 38;
-int centerY = 26;
-unsigned long blinkTimer = 0;
-bool blinkState = false;
+// === Modes ===
+enum Mode { MODE_VOLUME, MODE_FOCUS, MODE_PINGPONG };
+Mode currentMode = MODE_VOLUME;
+Mode selectedMode = MODE_VOLUME;
 
-int lastClkState;
-const int stepsPerRotation = 20;
-const int valuePerStep = 1023 / stepsPerRotation;
-
-// ===== Focus Timer =====
-bool focusMode = false;
+// === Focus Timer ===
 bool focusTimerRunning = false;
 bool settingTimer = false;
 bool timerPaused = false;
@@ -38,84 +21,64 @@ bool timerCompleted = false;
 unsigned long focusStartTime = 0;
 unsigned long focusPausedTime = 0;
 unsigned long focusDuration = 0;
-int setMinutes = 25;
-bool showModePopup = false;
-String modeName = "";
-unsigned long popupStartTime = 0;
 unsigned long lastTimerUpdate = 0;
+int setMinutes = 25;
 
-// ===== Helper =====
-int clamp(int v) {
-  return v < 0 ? 0 : v > 1023 ? 1023 : v;
-}
+// === Encoder + Volume ===
+int values[3] = {512, 512, 512};
+int activeSlot = 0;
+const char* appNames[3] = {"Master", "Chrome", "Spotify"};
+int lastClkState;
+const int valuePerStep = 50;
 
-// ✅ Correct Deej format with CR+LF
+// === Ping Pong ===
+int paddleX = 54;
+int ballX = 64, ballY = 32;
+int ballDirX = 1, ballDirY = 1;
+unsigned long lastPingPongUpdate = 0;
+
+// === Button ===
+bool btn, lastButton = HIGH;
+unsigned long buttonPressTime = 0;
+unsigned long lastButtonReleaseTime = 0;
+bool longPressHandled = false;
+bool waitingForSecondPress = false;
+bool showMenu = false;
+
+// === Standby ===
+bool inStandby = false;
+unsigned long lastActivity = 0;
+const unsigned long STANDBY_TIMEOUT = 30000; // 30 sec
+int eyeSize = 38;
+int centerY = 26;
+
+// === Helpers ===
+int clamp(int v) { return v < 0 ? 0 : (v > 1023 ? 1023 : v); }
+
 void sendValues() {
-  Serial.print(values[0]);
-  Serial.print("|");
-  Serial.print(values[1]);
-  Serial.print("|");
-  Serial.print(values[2]);
-  Serial.print("\r\n");
-  Serial.flush();  // ensures Deej receives immediately
+  Serial.printf("%d|%d|%d\r\n", values[0], values[1], values[2]);
+  Serial.flush();
 }
 
-// ===== OLED Displays =====
-void drawModePopup(String msg) {
+// === Display Functions ===
+void drawModeSelector() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawRBox(10, 24, 108, 20, 4);
-  u8g2.setDrawColor(0);
-  u8g2.setCursor(20, 38);
-  u8g2.print(msg);
-  u8g2.setDrawColor(1);
-  u8g2.sendBuffer();
-}
+  u8g2.drawStr(35, 10, "Select Mode");
+  const char* options[] = {"🎚 Volume", "⏱ Focus Timer", "🏓 Ping Pong"};
 
-void displaySetTimer() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 12, "Set Focus Time:");
-  u8g2.setFont(u8g2_font_ncenB14_tr);
-  char buf[10];
-  sprintf(buf, "%d min", setMinutes);
-  u8g2.drawStr(25, 40, buf);
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(10, 60, "Press to start");
-  u8g2.sendBuffer();
-}
-
-void displayFocusTimer() {
-  u8g2.clearBuffer();
-
-  if (timerCompleted) {
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(10, 30, "Session Complete!");
-    u8g2.drawStr(10, 50, "Double-press to Set Time");
-    u8g2.sendBuffer();
-    return;
+  for (int i = 0; i < 3; i++) {
+    if (i == selectedMode) {
+      u8g2.drawRBox(8, 18 + i * 14, 112, 12, 3);
+      u8g2.setDrawColor(0);
+      u8g2.setCursor(20, 28 + i * 14);
+      u8g2.print(options[i]);
+      u8g2.setDrawColor(1);
+    } else {
+      u8g2.setCursor(20, 28 + i * 14);
+      u8g2.print(options[i]);
+    }
   }
-
-  unsigned long remaining = focusDuration;
-  if (focusTimerRunning) {
-    unsigned long elapsed = millis() - focusStartTime;
-    remaining = (elapsed >= focusDuration) ? 0 : (focusDuration - elapsed);
-  }
-
-  int minutes = remaining / 60000;
-  int seconds = (remaining % 60000) / 1000;
-  char buf[16];
-  sprintf(buf, "%02d:%02d", minutes, seconds);
-
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 12, "Focus Timer:");
-  u8g2.setFont(u8g2_font_ncenB14_tr);
-  u8g2.drawStr(32, 40, buf);
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-  if (timerPaused)
-    u8g2.drawStr(10, 60, "Press: Resume");
-  else
-    u8g2.drawStr(10, 60, "Press: Pause");
   u8g2.sendBuffer();
 }
 
@@ -136,200 +99,315 @@ void displayActiveApp() {
   u8g2.sendBuffer();
 }
 
-// ===== Eye animation =====
-void drawEyes(bool blink) {
+void displaySetTimer() {
   u8g2.clearBuffer();
-  int leftX = 32 - eyeSize / 2;
-  int rightX = 96 - eyeSize / 2;
-  if (blink) {
-    u8g2.drawHLine(leftX, centerY, eyeSize);
-    u8g2.drawHLine(rightX, centerY, eyeSize);
-  } else {
-    u8g2.drawRBox(leftX, centerY - eyeSize / 2, eyeSize, eyeSize, 8);
-    u8g2.drawRBox(rightX, centerY - eyeSize / 2, eyeSize, eyeSize, 8);
-  }
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(0, 12, "Set Focus Time:");
+  char buf[10];
+  sprintf(buf, "%d min", setMinutes);
+  u8g2.setFont(u8g2_font_ncenB14_tr);
+  u8g2.drawStr(25, 40, buf);
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(10, 60, "Short press to Start");
   u8g2.sendBuffer();
 }
 
-void standbyAnimation() {
-  if (millis() - blinkTimer > 3000) {
-    blinkTimer = millis();
-    blinkState = true;
+void displayFocusTimer() {
+  u8g2.clearBuffer();
+  unsigned long remaining = focusDuration;
+  if (focusTimerRunning && !timerPaused) {
+    unsigned long elapsed = millis() - focusStartTime;
+    remaining = (elapsed >= focusDuration) ? 0 : (focusDuration - elapsed);
+  } else if (timerPaused) {
+    unsigned long elapsed = focusPausedTime - focusStartTime;
+    remaining = (focusDuration > elapsed) ? (focusDuration - elapsed) : 0;
   }
-  if (blinkState && millis() - blinkTimer > 120)
-    blinkState = false;
-  drawEyes(blinkState);
+  int minutes = remaining / 60000;
+  int seconds = (remaining % 60000) / 1000;
+  char buf[16];
+  sprintf(buf, "%02d:%02d", minutes, seconds);
+  u8g2.setFont(u8g2_font_ncenB14_tr);
+  u8g2.drawStr(32, 40, buf);
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  if (timerPaused)
+    u8g2.drawStr(10, 60, "Short press: Resume / Double: Set");
+  else if (focusTimerRunning)
+    u8g2.drawStr(10, 60, "Short press: Pause / Double: Set");
+  else if (timerCompleted)
+    u8g2.drawStr(10, 60, "Double press: Set Time");
+  else
+    u8g2.drawStr(10, 60, "Short press to Start");
+  u8g2.sendBuffer();
 }
 
-// ===== Setup =====
+void drawPingPong() {
+  u8g2.clearBuffer();
+  u8g2.drawBox(paddleX, 60, 20, 3);
+  u8g2.drawDisc(ballX, ballY, 2);
+  u8g2.sendBuffer();
+}
+
+void drawEyesFade(int brightness) {
+  u8g2.clearBuffer();
+  // use contrast to mimic fade; keep background black
+  u8g2.setContrast(brightness);
+  int leftX = 32 - 19;
+  int rightX = 96 - 19;
+  u8g2.drawRBox(leftX, centerY - 19, 38, 38, 8);
+  u8g2.drawRBox(rightX, centerY - 19, 38, 38, 8);
+  u8g2.sendBuffer();
+}
+
+void fadeInEyes() {
+  for (int i = 0; i <= 255; i += 25) {
+    drawEyesFade(i);
+    delay(8);
+  }
+}
+
+void fadeOutEyes() {
+  for (int i = 255; i >= 0; i -= 25) {
+    drawEyesFade(i);
+    delay(8);
+  }
+}
+
+void buzzAlert() {
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
+}
+
+// === Setup ===
 void setup() {
   Serial.begin(9600);
   Wire.begin(21, 22);
   u8g2.begin();
-
   pinMode(CLK_PIN, INPUT_PULLUP);
   pinMode(DT_PIN, INPUT_PULLUP);
   pinMode(SW_PIN, INPUT_PULLUP);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
-
   lastClkState = digitalRead(CLK_PIN);
   lastActivity = millis();
   displayActiveApp();
   sendValues();
 }
 
-// ===== Loop =====
+// === Loop ===
 void loop() {
-  bool activity = false;
-  int clkState = digitalRead(CLK_PIN);
-  int dtState = digitalRead(DT_PIN);
-  bool btn = digitalRead(SW_PIN);
+  int clk = digitalRead(CLK_PIN);
+  int dt = digitalRead(DT_PIN);
+  btn = digitalRead(SW_PIN);
+  unsigned long now = millis();
 
-  static unsigned long lastPressTime = 0;
-  static bool waitingForSecondPress = false;
-
-  // ===== Encoder rotation =====
-  if (clkState != lastClkState && clkState == LOW) {
-    if (focusMode && settingTimer) {
-      if (dtState == HIGH) setMinutes++;
-      else setMinutes--;
-      if (setMinutes < 1) setMinutes = 1;
-      if (setMinutes > 120) setMinutes = 120;
-      displaySetTimer();
-    } else if (!focusMode) {
-      if (dtState == HIGH) values[activeSlot] += valuePerStep;
-      else values[activeSlot] -= valuePerStep;
-      values[activeSlot] = clamp(values[activeSlot]);
-      sendValues();
-      displayActiveApp();
-    }
-    activity = true;
-  }
-  lastClkState = clkState;
-
-  // ===== Button press tracking =====
+  // ===== Long Press -> open menu =====
   if (btn == LOW && lastButton == HIGH) {
-    buttonPressTime = millis();
-    buttonHeld = false;
+    buttonPressTime = now;
+    longPressHandled = false;
+  }
+  if (btn == LOW && !longPressHandled && (now - buttonPressTime > 1500)) {
+    longPressHandled = true;
+    showMenu = true;
+    inStandby = false;          // disable standby while in menu
+    selectedMode = currentMode;
+    drawModeSelector();
+    lastActivity = now;
   }
 
-  // ===== Long press → toggle mode =====
-  if (btn == LOW && !buttonHeld && millis() - buttonPressTime > 2000) {
-    buttonHeld = true;
-    focusMode = !focusMode;
-    settingTimer = focusMode;
-    showModePopup = true;
-    modeName = focusMode ? "⏱ FocusMode" : "🎚 Volume Mode";
-    popupStartTime = millis();
-    if (focusMode)
-      displaySetTimer();
-    else
-      displayActiveApp();
-    waitingForSecondPress = false;
-  }
+  // ===== Button Released =====
+  if (btn == HIGH && lastButton == LOW) {
+    unsigned long pressDuration = now - buttonPressTime;
 
-  // ===== Button released =====
-  if (btn == HIGH && lastButton == LOW && !buttonHeld) {
-    unsigned long now = millis();
-
-    if (focusMode) {
-      if (waitingForSecondPress && now - lastPressTime < 600) {
+    // If we're in Focus mode and not in settingTimer, handle double-press timing
+    if (currentMode == MODE_FOCUS && !settingTimer && !showMenu) {
+      if (waitingForSecondPress && (now - lastButtonReleaseTime <= 450)) {
+        // Double press detected -> go to Set Time immediately
         waitingForSecondPress = false;
         focusTimerRunning = false;
         timerPaused = false;
         timerCompleted = false;
         settingTimer = true;
         displaySetTimer();
+        lastActivity = now;
+        lastButton = btn;
+        return;
       } else {
+        // Start waiting for a potential second press
         waitingForSecondPress = true;
-        lastPressTime = now;
+        lastButtonReleaseTime = now;
+        // DO NOT execute single-press action yet; wait in main loop for timeout
       }
     } else {
-      activeSlot = (activeSlot + 1) % 3;
-      displayActiveApp();
-    }
-    activity = true;
-  }
-
-  // ===== After 600ms with no 2nd press → handle as single press =====
-  if (waitingForSecondPress && millis() - lastPressTime > 600) {
-    waitingForSecondPress = false;
-    if (focusMode) {
-      if (settingTimer) {
-        focusDuration = (unsigned long)setMinutes * 60UL * 1000UL;
-        focusStartTime = millis();
-        focusTimerRunning = true;
-        settingTimer = false;
-        displayFocusTimer();
-      } else if (focusTimerRunning) {
-        timerPaused = !timerPaused;
-        if (timerPaused)
-          focusPausedTime = millis();
-        else
-          focusStartTime += (millis() - focusPausedTime);
-        displayFocusTimer();
+      // Not in double-press candidate state (either settingTimer or other mode)
+      if (!longPressHandled && pressDuration < 500) {
+        // Immediate actions (no double-press delay) when in settingTimer or other modes
+        if (showMenu) {
+          // confirm mode selection
+          currentMode = selectedMode;
+          showMenu = false;
+          if (currentMode == MODE_VOLUME) displayActiveApp();
+          else if (currentMode == MODE_FOCUS) {
+            settingTimer = true;
+            focusTimerRunning = false;
+            timerPaused = false;
+            displaySetTimer();
+          } else {
+            // pingpong
+            drawPingPong();
+          }
+          lastActivity = now;
+        } else if (currentMode == MODE_VOLUME) {
+          // change active slot
+          activeSlot = (activeSlot + 1) % 3;
+          displayActiveApp();
+          lastActivity = now;
+        } else if (currentMode == MODE_FOCUS && settingTimer) {
+          // Start timer immediately from Set screen (no waiting for double)
+          focusDuration = (unsigned long)setMinutes * 60000UL;
+          focusStartTime = now;
+          focusTimerRunning = true;
+          timerPaused = false;
+          settingTimer = false;
+          timerCompleted = false;
+          displayFocusTimer();
+          lastActivity = now;
+        } else if (currentMode == MODE_PINGPONG) {
+          // Could be used for UI feedback; nothing here
+        }
       }
     }
   }
 
-  if (btn == HIGH) buttonHeld = false;
+  // ===== If waiting for a possible double-press, check timeout to perform single action =====
+  if (waitingForSecondPress) {
+    if (millis() - lastButtonReleaseTime > 450) { // no second press - treat as single
+      waitingForSecondPress = false;
+      // Perform single-press action for focus mode (toggle pause/resume)
+      if (currentMode == MODE_FOCUS && !settingTimer) {
+        if (focusTimerRunning) {
+          // toggle pause/resume
+          timerPaused = !timerPaused;
+          if (timerPaused) {
+            focusPausedTime = millis();
+          } else {
+            // resume: shift start time forward by paused duration
+            focusStartTime += (millis() - focusPausedTime);
+          }
+          displayFocusTimer();
+          lastActivity = millis();
+        } else {
+          // If timer was not running and not in settingTimer, do nothing
+        }
+      }
+    }
+  }
+
   lastButton = btn;
 
-  // ===== Popup display =====
-  if (showModePopup && millis() - popupStartTime < 1000)
-    drawModePopup(modeName);
-  else
-    showModePopup = false;
+  // ===== Menu navigation =====
+  if (showMenu) {
+    if (clk != lastClkState && clk == LOW) {
+      if (dt == HIGH)
+        selectedMode = (Mode)((selectedMode + 1) % 3);
+      else
+        selectedMode = (Mode)((selectedMode + 2) % 3);
+      drawModeSelector();
+      delay(120);
+    }
+    lastClkState = clk;
+    return; // skip other mode logic while menu active
+  }
 
-  // ===== Background timer update + buzzer logic =====
-  if (focusTimerRunning && !timerPaused && millis() - lastTimerUpdate >= 1000) {
-    lastTimerUpdate = millis();
+  // ===== Mode Logic =====
+  if (currentMode == MODE_VOLUME) {
+    // encoder adjusts current slot volume
+    if (clk != lastClkState && clk == LOW) {
+      if (dt == HIGH) values[activeSlot] = clamp(values[activeSlot] + valuePerStep);
+      else values[activeSlot] = clamp(values[activeSlot] - valuePerStep);
+      sendValues();
+      displayActiveApp();
+      lastActivity = millis();
+      delay(8); // small debounce
+    }
+    lastClkState = clk;
+  }
 
-    unsigned long elapsed = millis() - focusStartTime;
-    if (elapsed >= focusDuration) {
-      focusTimerRunning = false;
-      timerPaused = false;
-      timerCompleted = true;
+  else if (currentMode == MODE_FOCUS) {
+    // when setting timer, encoder changes setMinutes
+    if (settingTimer && clk != lastClkState && clk == LOW) {
+      if (dt == HIGH) setMinutes++;
+      else setMinutes--;
+      setMinutes = constrain(setMinutes, 1, 120);
+      displaySetTimer();
+      lastActivity = millis();
+      delay(8);
+    }
+    lastClkState = clk;
 
-      // 🔔 Buzzer alert works in all modes
-      for (int i = 0; i < 5; i++) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        delay(100);
-        digitalWrite(BUZZER_PIN, LOW);
-        delay(100);
+    // timer countdown when running and not paused
+    if (focusTimerRunning && !timerPaused && millis() - lastTimerUpdate >= 1000) {
+      lastTimerUpdate = millis();
+      unsigned long elapsed = millis() - focusStartTime;
+      if (elapsed >= focusDuration) {
+        // timer finished
+        focusTimerRunning = false;
+        timerPaused = false;
+        timerCompleted = true;
+        buzzAlert();
+        settingTimer = true;       // return to set screen
+        displaySetTimer();
+        lastActivity = millis();
+      } else {
+        displayFocusTimer();
       }
-
-      if (focusMode)
-        displayFocusTimer();
-      else
-        displayActiveApp();
-    } else {
-      if (focusMode)
-        displayFocusTimer();
-      else
-        displayActiveApp();
     }
   }
 
-  // ===== Background Deej sync (heartbeat) =====
-  static unsigned long lastDeejUpdate = 0;
-  if (!focusMode && millis() - lastDeejUpdate > 200) {
-    sendValues();
-    lastDeejUpdate = millis();
+  else if (currentMode == MODE_PINGPONG) {
+    // map values[0] as encoder-controlled position for smooth movement (one rotation -> full travel)
+    paddleX = map(values[0], 0, 1023, 0, 108);
+
+    // optionally allow fine adjustments with encoder clicks
+    if (clk != lastClkState && clk == LOW) {
+      if (dt == HIGH) values[0] = clamp(values[0] + 40);
+      else values[0] = clamp(values[0] - 40);
+      lastActivity = millis();
+      delay(8);
+    }
+    lastClkState = clk;
+
+    if (millis() - lastPingPongUpdate > 30) {
+      lastPingPongUpdate = millis();
+      ballX += ballDirX * 2;
+      ballY += ballDirY * 2;
+      if (ballX <= 2 || ballX >= 126) ballDirX = -ballDirX;
+      if (ballY <= 2) ballDirY = -ballDirY;
+      if (ballY >= 58 && ballX > paddleX && ballX < paddleX + 20) ballDirY = -ballDirY;
+      if (ballY > 63) {
+        ballX = 64; ballY = 32; ballDirY = -1;
+        buzzAlert();
+      }
+      drawPingPong();
+    }
   }
 
-  // ===== Standby logic =====
-  if (activity) {
-    lastActivity = millis();
-    inStandby = false;
+  // ===== Standby (only in Volume Mode) =====
+  if (currentMode == MODE_VOLUME) {
+    if (!inStandby && millis() - lastActivity > STANDBY_TIMEOUT) {
+      inStandby = true;
+      fadeInEyes();
+    }
+    if (inStandby && btn == LOW) {
+      inStandby = false;
+      fadeOutEyes();
+      displayActiveApp();
+      lastActivity = millis();
+    }
   }
 
-  if (!inStandby && millis() - lastActivity > STANDBY_TIMEOUT && !focusTimerRunning) {
-    inStandby = true;
-    drawEyes(false);
-  }
-
-  if (inStandby) standbyAnimation();
-  delay(1);
+  delay(2);
 }
