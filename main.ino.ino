@@ -49,7 +49,7 @@ int clamp(int v) {
   return v < 0 ? 0 : v > 1023 ? 1023 : v;
 }
 
-// ✅ Fixed: CR+LF line endings for Deej 0.9.10 compatibility
+// ✅ Correct Deej format with CR+LF
 void sendValues() {
   Serial.print(values[0]);
   Serial.print("|");
@@ -57,6 +57,7 @@ void sendValues() {
   Serial.print("|");
   Serial.print(values[2]);
   Serial.print("\r\n");
+  Serial.flush();  // ensures Deej receives immediately
 }
 
 // ===== OLED Displays =====
@@ -98,22 +99,7 @@ void displayFocusTimer() {
   unsigned long remaining = focusDuration;
   if (focusTimerRunning) {
     unsigned long elapsed = millis() - focusStartTime;
-    if (elapsed >= focusDuration) {
-      focusTimerRunning = false;
-      timerPaused = false;
-      timerCompleted = true;
-      displayFocusTimer();
-
-      // 🔔 Buzzer alert when session ends
-      for (int i = 0; i < 3; i++) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        delay(100);
-        digitalWrite(BUZZER_PIN, LOW);
-        delay(100);
-      }
-      return;
-    }
-    remaining = focusDuration - elapsed;
+    remaining = (elapsed >= focusDuration) ? 0 : (focusDuration - elapsed);
   }
 
   int minutes = remaining / 60000;
@@ -296,18 +282,39 @@ void loop() {
   else
     showModePopup = false;
 
-  // ===== Background timer update =====
+  // ===== Background timer update + buzzer logic =====
   if (focusTimerRunning && !timerPaused && millis() - lastTimerUpdate >= 1000) {
     lastTimerUpdate = millis();
-    if (focusMode)
-      displayFocusTimer();
-    else
-      displayActiveApp();
+
+    unsigned long elapsed = millis() - focusStartTime;
+    if (elapsed >= focusDuration) {
+      focusTimerRunning = false;
+      timerPaused = false;
+      timerCompleted = true;
+
+      // 🔔 Buzzer alert works in all modes
+      for (int i = 0; i < 5; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(100);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(100);
+      }
+
+      if (focusMode)
+        displayFocusTimer();
+      else
+        displayActiveApp();
+    } else {
+      if (focusMode)
+        displayFocusTimer();
+      else
+        displayActiveApp();
+    }
   }
 
   // ===== Background Deej sync (heartbeat) =====
   static unsigned long lastDeejUpdate = 0;
-  if (!focusMode && millis() - lastDeejUpdate > 100) {
+  if (!focusMode && millis() - lastDeejUpdate > 200) {
     sendValues();
     lastDeejUpdate = millis();
   }
