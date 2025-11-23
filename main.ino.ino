@@ -22,6 +22,7 @@ unsigned long focusStartTime = 0;
 unsigned long focusPausedTime = 0;
 unsigned long focusDuration = 0;
 unsigned long lastTimerUpdate = 0;
+unsigned long remainingAtPause = 0; // stored remaining when paused
 int setMinutes = 25;
 
 // === Encoder + Volume ===
@@ -52,6 +53,9 @@ const unsigned long STANDBY_TIMEOUT = 30000; // 30 sec
 int eyeSize = 38;
 int centerY = 26;
 
+// === Overlay update tracking ===
+long lastOverlaySecond = -1; // tracks last displayed seconds to avoid redundant redraws
+
 // === Helpers ===
 int clamp(int v) { return v < 0 ? 0 : (v > 1023 ? 1023 : v); }
 
@@ -60,7 +64,23 @@ void sendValues() {
   Serial.flush();
 }
 
-// === Display Functions ===
+// Centralized remaining-time calculator (returns milliseconds remaining)
+unsigned long getRemaining() {
+  if (timerPaused) {
+    return remainingAtPause;
+  }
+  if (focusTimerRunning) {
+    unsigned long elapsed = millis() - focusStartTime;
+    if (elapsed >= focusDuration) return 0;
+    return focusDuration - elapsed;
+  }
+  if (timerCompleted) {
+    return 0;
+  }
+  return 0;
+}
+
+// === Display draw functions (do NOT call sendBuffer here) ===
 void drawModeSelector() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
@@ -79,10 +99,9 @@ void drawModeSelector() {
       u8g2.print(options[i]);
     }
   }
-  u8g2.sendBuffer();
 }
 
-void displayActiveApp() {
+void drawActiveApp() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
   u8g2.drawStr(0, 12, "Active App:");
@@ -96,32 +115,23 @@ void displayActiveApp() {
   int filled = map(values[activeSlot], 0, 1023, 0, 128);
   u8g2.drawFrame(0, 54, 128, 10);
   u8g2.drawBox(0, 54, filled, 10);
-  u8g2.sendBuffer();
 }
 
-void displaySetTimer() {
+void drawSetTimer() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 12, "Set Focus Time:");
+  u8g2.drawStr(0, 12, "Set Time:");
   char buf[10];
   sprintf(buf, "%d min", setMinutes);
   u8g2.setFont(u8g2_font_ncenB14_tr);
   u8g2.drawStr(25, 40, buf);
   u8g2.setFont(u8g2_font_ncenB08_tr);
   u8g2.drawStr(10, 60, "Short press to Start");
-  u8g2.sendBuffer();
 }
 
-void displayFocusTimer() {
+void drawFocusTimerMain() {
   u8g2.clearBuffer();
-  unsigned long remaining = focusDuration;
-  if (focusTimerRunning && !timerPaused) {
-    unsigned long elapsed = millis() - focusStartTime;
-    remaining = (elapsed >= focusDuration) ? 0 : (focusDuration - elapsed);
-  } else if (timerPaused) {
-    unsigned long elapsed = focusPausedTime - focusStartTime;
-    remaining = (focusDuration > elapsed) ? (focusDuration - elapsed) : 0;
-  }
+  unsigned long remaining = getRemaining();
   int minutes = remaining / 60000;
   int seconds = (remaining % 60000) / 1000;
   char buf[16];
@@ -137,30 +147,27 @@ void displayFocusTimer() {
     u8g2.drawStr(10, 60, "Double press: Set Time");
   else
     u8g2.drawStr(10, 60, "Short press to Start");
-  u8g2.sendBuffer();
 }
 
 void drawPingPong() {
   u8g2.clearBuffer();
   u8g2.drawBox(paddleX, 60, 20, 3);
   u8g2.drawDisc(ballX, ballY, 2);
-  u8g2.sendBuffer();
 }
 
 void drawEyesFade(int brightness) {
   u8g2.clearBuffer();
-  // use contrast to mimic fade; keep background black
   u8g2.setContrast(brightness);
   int leftX = 32 - 19;
   int rightX = 96 - 19;
   u8g2.drawRBox(leftX, centerY - 19, 38, 38, 8);
   u8g2.drawRBox(rightX, centerY - 19, 38, 38, 8);
-  u8g2.sendBuffer();
 }
 
 void fadeInEyes() {
   for (int i = 0; i <= 255; i += 25) {
     drawEyesFade(i);
+    u8g2.sendBuffer();
     delay(8);
   }
 }
@@ -168,6 +175,7 @@ void fadeInEyes() {
 void fadeOutEyes() {
   for (int i = 255; i >= 0; i -= 25) {
     drawEyesFade(i);
+    u8g2.sendBuffer();
     delay(8);
   }
 }
@@ -178,6 +186,98 @@ void buzzAlert() {
     delay(100);
     digitalWrite(BUZZER_PIN, LOW);
     delay(100);
+  }
+}
+
+// Draws a small timer overlay (top-right). Call before sendBuffer.
+void drawSmallTimerOverlay() {
+  // Show overlay only when timer is running, paused, or completed
+  if (!focusTimerRunning && !timerPaused && !timerCompleted) return;
+
+  unsigned long remaining = getRemaining();
+  int minutes = remaining / 60000;
+  int seconds = (remaining % 60000) / 1000;
+  char buf[8];
+  sprintf(buf, "%02d:%02d", minutes, seconds);
+
+  int boxW = 48;
+  int boxH = 14;
+  int x = 128 - boxW - 2;
+  int y = 2;
+  u8g2.drawRBox(x, y, boxW, boxH, 3);
+  u8g2.setDrawColor(0); // inverted text
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setCursor(x + 6, y + 11);
+  u8g2.print(buf);
+  u8g2.setDrawColor(1); // restore
+}
+
+// Render wrapper: draw selected screen, add overlay, then sendBuffer
+void renderCurrentScreen() {
+  if (showMenu) {
+    drawModeSelector();
+  } else {
+    if (currentMode == MODE_VOLUME) {
+      drawActiveApp();
+    } else if (currentMode == MODE_FOCUS) {
+      if (settingTimer) drawSetTimer();
+      else drawFocusTimerMain();
+    } else if (currentMode == MODE_PINGPONG) {
+      drawPingPong();
+    }
+  }
+
+  // Overlay (draw on top of whatever is drawn)
+  drawSmallTimerOverlay();
+
+  // finally present
+  u8g2.sendBuffer();
+}
+
+// Update timer state in background (runs irrespective of mode)
+// Now also triggers redraw when the displayed second changes or on state changes.
+void updateFocusTimerBackground() {
+  // compute remaining once (centralized)
+  unsigned long remaining = getRemaining();
+  long remainingSec = (long)(remaining / 1000);
+
+  // If running and not paused, update per-second and detect completion
+  if (focusTimerRunning && !timerPaused) {
+    // ensure we only act each second to minimize draw frequency
+    if (millis() - lastTimerUpdate >= 250) { // check frequently but only redraw on second change
+      lastTimerUpdate = millis();
+
+      // timer finished?
+      if (remaining == 0) {
+        focusTimerRunning = false;
+        timerPaused = false;
+        timerCompleted = true;
+        buzzAlert();
+        settingTimer = true; // show set screen to allow quick restart
+        lastActivity = millis();
+        // force immediate redraw
+        lastOverlaySecond = -1;
+        renderCurrentScreen();
+        return;
+      }
+
+      // redraw overlay only when the displayed second changed
+      if (remainingSec != lastOverlaySecond) {
+        lastOverlaySecond = remainingSec;
+        renderCurrentScreen();
+      }
+    }
+  } else {
+    // Not actively running
+    // If paused or completed, ensure the overlay reflects that immediately (state change)
+    static bool prevPaused = false;
+    static bool prevCompleted = false;
+    if (timerPaused != prevPaused || timerCompleted != prevCompleted) {
+      prevPaused = timerPaused;
+      prevCompleted = timerCompleted;
+      lastOverlaySecond = -1; // force redraw
+      renderCurrentScreen();
+    }
   }
 }
 
@@ -193,7 +293,7 @@ void setup() {
   digitalWrite(BUZZER_PIN, LOW);
   lastClkState = digitalRead(CLK_PIN);
   lastActivity = millis();
-  displayActiveApp();
+  renderCurrentScreen();
   sendValues();
 }
 
@@ -203,6 +303,9 @@ void loop() {
   int dt = digitalRead(DT_PIN);
   btn = digitalRead(SW_PIN);
   unsigned long now = millis();
+
+  // Always update timer in background (this now triggers redraws correctly)
+  updateFocusTimerBackground();
 
   // ===== Long Press -> open menu =====
   if (btn == LOW && lastButton == HIGH) {
@@ -214,7 +317,8 @@ void loop() {
     showMenu = true;
     inStandby = false;          // disable standby while in menu
     selectedMode = currentMode;
-    drawModeSelector();
+    lastOverlaySecond = -1;
+    renderCurrentScreen();
     lastActivity = now;
   }
 
@@ -227,11 +331,10 @@ void loop() {
       if (waitingForSecondPress && (now - lastButtonReleaseTime <= 450)) {
         // Double press detected -> go to Set Time immediately
         waitingForSecondPress = false;
-        focusTimerRunning = false;
-        timerPaused = false;
-        timerCompleted = false;
+        // Keep timer running in background; just show set screen
         settingTimer = true;
-        displaySetTimer();
+        lastOverlaySecond = -1;
+        renderCurrentScreen();
         lastActivity = now;
         lastButton = btn;
         return;
@@ -249,34 +352,31 @@ void loop() {
           // confirm mode selection
           currentMode = selectedMode;
           showMenu = false;
-          if (currentMode == MODE_VOLUME) displayActiveApp();
-          else if (currentMode == MODE_FOCUS) {
-            settingTimer = true;
-            focusTimerRunning = false;
-            timerPaused = false;
-            displaySetTimer();
-          } else {
-            // pingpong
-            drawPingPong();
-          }
+          lastOverlaySecond = -1;
+          renderCurrentScreen();
           lastActivity = now;
         } else if (currentMode == MODE_VOLUME) {
           // change active slot
           activeSlot = (activeSlot + 1) % 3;
-          displayActiveApp();
+          lastOverlaySecond = -1;
+          renderCurrentScreen();
           lastActivity = now;
         } else if (currentMode == MODE_FOCUS && settingTimer) {
           // Start timer immediately from Set screen (no waiting for double)
           focusDuration = (unsigned long)setMinutes * 60000UL;
-          focusStartTime = now;
+          focusStartTime = millis();
           focusTimerRunning = true;
           timerPaused = false;
-          settingTimer = false;
           timerCompleted = false;
-          displayFocusTimer();
+          remainingAtPause = focusDuration; // full duration available now
+          lastTimerUpdate = millis();
+          // initialize overlay tracking
+          lastOverlaySecond = (long)(focusDuration / 1000);
+          settingTimer = false;
+          renderCurrentScreen();
           lastActivity = now;
         } else if (currentMode == MODE_PINGPONG) {
-          // Could be used for UI feedback; nothing here
+          // nothing special
         }
       }
     }
@@ -290,14 +390,27 @@ void loop() {
       if (currentMode == MODE_FOCUS && !settingTimer) {
         if (focusTimerRunning) {
           // toggle pause/resume
-          timerPaused = !timerPaused;
-          if (timerPaused) {
+          if (!timerPaused) {
+            // go to pause: capture remaining once
+            remainingAtPause = getRemaining();
+            timerPaused = true;
             focusPausedTime = millis();
+            // force redraw right away
+            lastOverlaySecond = -1;
+            renderCurrentScreen();
           } else {
-            // resume: shift start time forward by paused duration
-            focusStartTime += (millis() - focusPausedTime);
+            // resume: compute new start so remaining stays same
+            timerPaused = false;
+            unsigned long adjustedStart = millis();
+            if (focusDuration > remainingAtPause)
+              adjustedStart = millis() - (focusDuration - remainingAtPause);
+            focusStartTime = adjustedStart;
+            remainingAtPause = 0;
+            lastTimerUpdate = millis();
+            // force redraw right away
+            lastOverlaySecond = -1;
+            renderCurrentScreen();
           }
-          displayFocusTimer();
           lastActivity = millis();
         } else {
           // If timer was not running and not in settingTimer, do nothing
@@ -315,7 +428,8 @@ void loop() {
         selectedMode = (Mode)((selectedMode + 1) % 3);
       else
         selectedMode = (Mode)((selectedMode + 2) % 3);
-      drawModeSelector();
+      lastOverlaySecond = -1;
+      renderCurrentScreen();
       delay(120);
     }
     lastClkState = clk;
@@ -329,7 +443,8 @@ void loop() {
       if (dt == HIGH) values[activeSlot] = clamp(values[activeSlot] + valuePerStep);
       else values[activeSlot] = clamp(values[activeSlot] - valuePerStep);
       sendValues();
-      displayActiveApp();
+      lastOverlaySecond = -1;
+      renderCurrentScreen();
       lastActivity = millis();
       delay(8); // small debounce
     }
@@ -342,28 +457,16 @@ void loop() {
       if (dt == HIGH) setMinutes++;
       else setMinutes--;
       setMinutes = constrain(setMinutes, 1, 120);
-      displaySetTimer();
+      lastOverlaySecond = -1;
+      renderCurrentScreen();
       lastActivity = millis();
       delay(8);
     }
     lastClkState = clk;
 
-    // timer countdown when running and not paused
-    if (focusTimerRunning && !timerPaused && millis() - lastTimerUpdate >= 1000) {
-      lastTimerUpdate = millis();
-      unsigned long elapsed = millis() - focusStartTime;
-      if (elapsed >= focusDuration) {
-        // timer finished
-        focusTimerRunning = false;
-        timerPaused = false;
-        timerCompleted = true;
-        buzzAlert();
-        settingTimer = true;       // return to set screen
-        displaySetTimer();
-        lastActivity = millis();
-      } else {
-        displayFocusTimer();
-      }
+    // Redraw occasionally while in focus to keep UI responsive (overlay handled separately)
+    if (!settingTimer && (millis() - lastTimerUpdate >= 500)) {
+      renderCurrentScreen();
     }
   }
 
@@ -391,7 +494,7 @@ void loop() {
         ballX = 64; ballY = 32; ballDirY = -1;
         buzzAlert();
       }
-      drawPingPong();
+      renderCurrentScreen();
     }
   }
 
@@ -404,7 +507,8 @@ void loop() {
     if (inStandby && btn == LOW) {
       inStandby = false;
       fadeOutEyes();
-      displayActiveApp();
+      lastOverlaySecond = -1;
+      renderCurrentScreen();
       lastActivity = millis();
     }
   }
