@@ -8,8 +8,104 @@
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
+// ----- ButtonHandler: detects short / double / long presses -----
+enum BtnEvent { BTN_NONE = 0, BTN_SHORT, BTN_DOUBLE, BTN_LONG };
+
+class ButtonHandler {
+public:
+  // thresholds in ms
+  unsigned long debounceMs;
+  unsigned long longMs;   // long press threshold
+  unsigned long doubleMs; // max interval between two shorts to be a double
+
+  ButtonHandler(unsigned long db = 30, unsigned long lg = 1500, unsigned long db2 = 450) {
+    debounceMs = db; longMs = lg; doubleMs = db2;
+    lastRaw = HIGH; stableState = HIGH; lastDebounceTime = 0;
+    state = IDLE; pressTime = 0; waitingForDouble = false; longFired = false;
+    prevPaused = false; prevCompleted = false;
+    prevReleaseTime = 0;
+  }
+
+  // Call this every loop with the raw digitalRead(pin) value and current millis().
+  // Returns one event (BTN_NONE if nothing)
+  BtnEvent update(int raw, unsigned long now) {
+    // debounce
+    if (raw != lastRaw) {
+      lastDebounceTime = now;
+      lastRaw = raw;
+    }
+    if (now - lastDebounceTime >= debounceMs) {
+      if (stableState != raw) {
+        stableState = raw;
+        // stable edge
+        if (stableState == LOW) {
+          // pressed
+          pressTime = now;
+          longFired = false;
+          state = PRESSED;
+        } else {
+          // released
+          unsigned long dur = now - pressTime;
+          state = RELEASED;
+          // if long already fired, treat as long (no short/double)
+          if (longFired) {
+            waitingForDouble = false;
+            return BTN_NONE;
+          } else {
+            // candidate for short/double
+            if (waitingForDouble && (now - prevReleaseTime <= doubleMs)) {
+              waitingForDouble = false;
+              return BTN_DOUBLE;
+            } else {
+              // start waiting for possible second press
+              waitingForDouble = true;
+              prevReleaseTime = now;
+              // We'll emit BTN_SHORT later if no second press
+              return BTN_NONE;
+            }
+          }
+        }
+      }
+    }
+
+    // If currently pressed, check long-press threshold and emit exactly once when crossed
+    if (state == PRESSED && !longFired && (now - pressTime >= longMs)) {
+      longFired = true;
+      waitingForDouble = false; // cancel double detection
+      return BTN_LONG;
+    }
+
+    // Handle single-short resolution after double window passes
+    if (waitingForDouble && (now - prevReleaseTime > doubleMs)) {
+      waitingForDouble = false;
+      return BTN_SHORT;
+    }
+
+    return BTN_NONE;
+  }
+
+private:
+  // debounce vars
+  int lastRaw;
+  int stableState;
+  unsigned long lastDebounceTime;
+
+  // press state machine
+  enum S { IDLE = 0, PRESSED, RELEASED } state;
+  unsigned long pressTime;
+  bool longFired;
+
+  // double press waiting
+  bool waitingForDouble;
+  unsigned long prevReleaseTime;
+
+  // not used outside but kept for later enhancements
+  bool prevPaused;
+  bool prevCompleted;
+};
+
 // === Modes ===
-enum Mode { MODE_VOLUME, MODE_FOCUS, MODE_PINGPONG };
+enum Mode { MODE_VOLUME, MODE_FOCUS };
 Mode currentMode = MODE_VOLUME;
 Mode selectedMode = MODE_VOLUME;
 
@@ -32,29 +128,21 @@ const char* appNames[3] = {"Master", "Chrome", "Spotify"};
 int lastClkState;
 const int valuePerStep = 50;
 
-// === Ping Pong ===
-int paddleX = 54;
-int ballX = 64, ballY = 32;
-int ballDirX = 1, ballDirY = 1;
-unsigned long lastPingPongUpdate = 0;
-
-// === Button ===
-bool btn, lastButton = HIGH;
-unsigned long buttonPressTime = 0;
-unsigned long lastButtonReleaseTime = 0;
-bool longPressHandled = false;
-bool waitingForSecondPress = false;
-bool showMenu = false;
-
-// === Standby ===
+// === Standby / UI ===
 bool inStandby = false;
 unsigned long lastActivity = 0;
 const unsigned long STANDBY_TIMEOUT = 30000; // 30 sec
 int eyeSize = 38;
 int centerY = 26;
 
+// === Button / Menu ===
+bool showMenu = false;
+
 // === Overlay update tracking ===
 long lastOverlaySecond = -1; // tracks last displayed seconds to avoid redundant redraws
+
+// Button handler instance
+ButtonHandler btnHandler(30, 1500, 450);
 
 // === Helpers ===
 int clamp(int v) { return v < 0 ? 0 : (v > 1023 ? 1023 : v); }
@@ -84,10 +172,9 @@ unsigned long getRemaining() {
 void drawModeSelector() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(35, 10, "Select Mode");
-  const char* options[] = {"🎚 Volume", "⏱ Focus Timer", "🏓 Ping Pong"};
-
-  for (int i = 0; i < 3; i++) {
+  u8g2.drawStr(30, 10, "Select Mode");
+  const char* options[] = {"🎚 Volume", "⏱ Focus Timer"};
+  for (int i = 0; i < 2; i++) {
     if (i == selectedMode) {
       u8g2.drawRBox(8, 18 + i * 14, 112, 12, 3);
       u8g2.setDrawColor(0);
@@ -120,7 +207,7 @@ void drawActiveApp() {
 void drawSetTimer() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(0, 12, "Set Time:");
+  u8g2.drawStr(0, 12, "Set Focus Time:");
   char buf[10];
   sprintf(buf, "%d min", setMinutes);
   u8g2.setFont(u8g2_font_ncenB14_tr);
@@ -147,12 +234,6 @@ void drawFocusTimerMain() {
     u8g2.drawStr(10, 60, "Double press: Set Time");
   else
     u8g2.drawStr(10, 60, "Short press to Start");
-}
-
-void drawPingPong() {
-  u8g2.clearBuffer();
-  u8g2.drawBox(paddleX, 60, 20, 3);
-  u8g2.drawDisc(ballX, ballY, 2);
 }
 
 void drawEyesFade(int brightness) {
@@ -222,8 +303,6 @@ void renderCurrentScreen() {
     } else if (currentMode == MODE_FOCUS) {
       if (settingTimer) drawSetTimer();
       else drawFocusTimerMain();
-    } else if (currentMode == MODE_PINGPONG) {
-      drawPingPong();
     }
   }
 
@@ -258,6 +337,7 @@ void updateFocusTimerBackground() {
         // force immediate redraw
         lastOverlaySecond = -1;
         renderCurrentScreen();
+        // if no timer active (we just completed but still show completed state) do not alter standby here
         return;
       }
 
@@ -301,117 +381,110 @@ void setup() {
 void loop() {
   int clk = digitalRead(CLK_PIN);
   int dt = digitalRead(DT_PIN);
-  btn = digitalRead(SW_PIN);
+  int rawBtn = digitalRead(SW_PIN); // raw button for handler
   unsigned long now = millis();
 
   // Always update timer in background (this now triggers redraws correctly)
   updateFocusTimerBackground();
 
-  // ===== Long Press -> open menu =====
-  if (btn == LOW && lastButton == HIGH) {
-    buttonPressTime = now;
-    longPressHandled = false;
-  }
-  if (btn == LOW && !longPressHandled && (now - buttonPressTime > 1500)) {
-    longPressHandled = true;
-    showMenu = true;
-    inStandby = false;          // disable standby while in menu
-    selectedMode = currentMode;
+  // --- Ensure eyes are off when there is no active timer ---
+  // Only allow standby (eyes) if timer is active (running, paused, or completed).
+  // If a timer is not active and eyes are currently blinking, turn them off.
+  bool timerIsActive = (focusTimerRunning || timerPaused || timerCompleted);
+  if (!timerIsActive && inStandby) {
+    // timer turned off while in standby -> stop eyes
+    inStandby = false;
+    fadeOutEyes();
     lastOverlaySecond = -1;
     renderCurrentScreen();
-    lastActivity = now;
   }
 
-  // ===== Button Released =====
-  if (btn == HIGH && lastButton == LOW) {
-    unsigned long pressDuration = now - buttonPressTime;
+  // === Button handling via ButtonHandler ===
+  BtnEvent ev = btnHandler.update(rawBtn, now);
+  if (ev != BTN_NONE) {
+    // Wake up from standby on any button event (but standby will only exist if timer was active)
+    if (inStandby) {
+      inStandby = false;
+      fadeOutEyes();
+      lastOverlaySecond = -1;
+      renderCurrentScreen();
+      lastActivity = now;
+    }
 
-    // If we're in Focus mode and not in settingTimer, handle double-press timing
-    if (currentMode == MODE_FOCUS && !settingTimer && !showMenu) {
-      if (waitingForSecondPress && (now - lastButtonReleaseTime <= 450)) {
-        // Double press detected -> go to Set Time immediately
-        waitingForSecondPress = false;
-        // Keep timer running in background; just show set screen
+    if (ev == BTN_LONG) {
+      // Long press: open menu (fires once while button held)
+      showMenu = true;
+      inStandby = false;
+      selectedMode = currentMode;
+      lastOverlaySecond = -1;
+      renderCurrentScreen();
+    } else if (ev == BTN_DOUBLE) {
+      // Double press
+      if (showMenu) {
+        // confirm selection
+        currentMode = selectedMode;
+        showMenu = false;
+        lastOverlaySecond = -1;
+        renderCurrentScreen();
+      } else if (currentMode == MODE_FOCUS && !settingTimer) {
+        // go to set time screen (timer continues running in background)
         settingTimer = true;
         lastOverlaySecond = -1;
         renderCurrentScreen();
-        lastActivity = now;
-        lastButton = btn;
-        return;
       } else {
-        // Start waiting for a potential second press
-        waitingForSecondPress = true;
-        lastButtonReleaseTime = now;
-        // DO NOT execute single-press action yet; wait in main loop for timeout
+        // other double-press uses can be added here
       }
-    } else {
-      // Not in double-press candidate state (either settingTimer or other mode)
-      if (!longPressHandled && pressDuration < 500) {
-        // Immediate actions (no double-press delay) when in settingTimer or other modes
-        if (showMenu) {
-          // confirm mode selection
-          currentMode = selectedMode;
-          showMenu = false;
+    } else if (ev == BTN_SHORT) {
+      // Short press (single)
+      if (showMenu) {
+        // confirm mode selection
+        currentMode = selectedMode;
+        showMenu = false;
+        lastOverlaySecond = -1;
+        renderCurrentScreen();
+      } else if (currentMode == MODE_VOLUME) {
+        // change active slot
+        activeSlot = (activeSlot + 1) % 3;
+        lastOverlaySecond = -1;
+        renderCurrentScreen();
+        lastActivity = now;
+      } else if (currentMode == MODE_FOCUS && settingTimer) {
+        // Start timer immediately from Set screen
+        focusDuration = (unsigned long)setMinutes * 60000UL;
+        focusStartTime = millis();
+        focusTimerRunning = true;
+        timerPaused = false;
+        timerCompleted = false;
+        remainingAtPause = focusDuration; // full duration available now
+        lastTimerUpdate = millis();
+        // initialize overlay tracking
+        lastOverlaySecond = (long)(focusDuration / 1000);
+        settingTimer = false;
+        lastOverlaySecond = -1;
+        renderCurrentScreen();
+        lastActivity = now;
+      } else if (currentMode == MODE_FOCUS && !settingTimer) {
+        // toggle pause/resume
+        if (focusTimerRunning && !timerPaused) {
+          // pause: capture remaining once
+          remainingAtPause = getRemaining();
+          timerPaused = true;
+          focusPausedTime = millis();
           lastOverlaySecond = -1;
           renderCurrentScreen();
           lastActivity = now;
-        } else if (currentMode == MODE_VOLUME) {
-          // change active slot
-          activeSlot = (activeSlot + 1) % 3;
-          lastOverlaySecond = -1;
-          renderCurrentScreen();
-          lastActivity = now;
-        } else if (currentMode == MODE_FOCUS && settingTimer) {
-          // Start timer immediately from Set screen (no waiting for double)
-          focusDuration = (unsigned long)setMinutes * 60000UL;
-          focusStartTime = millis();
-          focusTimerRunning = true;
+        } else if (timerPaused) {
+          // resume: compute new start so remaining stays same
           timerPaused = false;
-          timerCompleted = false;
-          remainingAtPause = focusDuration; // full duration available now
+          unsigned long adjustedStart = millis();
+          if (focusDuration > remainingAtPause)
+            adjustedStart = millis() - (focusDuration - remainingAtPause);
+          focusStartTime = adjustedStart;
+          remainingAtPause = 0;
           lastTimerUpdate = millis();
-          // initialize overlay tracking
-          lastOverlaySecond = (long)(focusDuration / 1000);
-          settingTimer = false;
+          lastOverlaySecond = -1;
           renderCurrentScreen();
           lastActivity = now;
-        } else if (currentMode == MODE_PINGPONG) {
-          // nothing special
-        }
-      }
-    }
-  }
-
-  // ===== If waiting for a possible double-press, check timeout to perform single action =====
-  if (waitingForSecondPress) {
-    if (millis() - lastButtonReleaseTime > 450) { // no second press - treat as single
-      waitingForSecondPress = false;
-      // Perform single-press action for focus mode (toggle pause/resume)
-      if (currentMode == MODE_FOCUS && !settingTimer) {
-        if (focusTimerRunning) {
-          // toggle pause/resume
-          if (!timerPaused) {
-            // go to pause: capture remaining once
-            remainingAtPause = getRemaining();
-            timerPaused = true;
-            focusPausedTime = millis();
-            // force redraw right away
-            lastOverlaySecond = -1;
-            renderCurrentScreen();
-          } else {
-            // resume: compute new start so remaining stays same
-            timerPaused = false;
-            unsigned long adjustedStart = millis();
-            if (focusDuration > remainingAtPause)
-              adjustedStart = millis() - (focusDuration - remainingAtPause);
-            focusStartTime = adjustedStart;
-            remainingAtPause = 0;
-            lastTimerUpdate = millis();
-            // force redraw right away
-            lastOverlaySecond = -1;
-            renderCurrentScreen();
-          }
-          lastActivity = millis();
         } else {
           // If timer was not running and not in settingTimer, do nothing
         }
@@ -419,21 +492,20 @@ void loop() {
     }
   }
 
-  lastButton = btn;
-
-  // ===== Menu navigation =====
+  // ===== Menu navigation (encoder) =====
   if (showMenu) {
     if (clk != lastClkState && clk == LOW) {
       if (dt == HIGH)
-        selectedMode = (Mode)((selectedMode + 1) % 3);
+        selectedMode = (Mode)((selectedMode + 1) % 2);
       else
-        selectedMode = (Mode)((selectedMode + 2) % 3);
+        selectedMode = (Mode)((selectedMode + 1) % 2); // same since only 2 items
       lastOverlaySecond = -1;
       renderCurrentScreen();
       delay(120);
     }
     lastClkState = clk;
-    return; // skip other mode logic while menu active
+    // skip other mode logic while menu active
+    return;
   }
 
   // ===== Mode Logic =====
@@ -449,9 +521,7 @@ void loop() {
       delay(8); // small debounce
     }
     lastClkState = clk;
-  }
-
-  else if (currentMode == MODE_FOCUS) {
+  } else if (currentMode == MODE_FOCUS) {
     // when setting timer, encoder changes setMinutes
     if (settingTimer && clk != lastClkState && clk == LOW) {
       if (dt == HIGH) setMinutes++;
@@ -470,47 +540,15 @@ void loop() {
     }
   }
 
-  else if (currentMode == MODE_PINGPONG) {
-    // map values[0] as encoder-controlled position for smooth movement (one rotation -> full travel)
-    paddleX = map(values[0], 0, 1023, 0, 108);
-
-    // optionally allow fine adjustments with encoder clicks
-    if (clk != lastClkState && clk == LOW) {
-      if (dt == HIGH) values[0] = clamp(values[0] + 40);
-      else values[0] = clamp(values[0] - 40);
-      lastActivity = millis();
-      delay(8);
-    }
-    lastClkState = clk;
-
-    if (millis() - lastPingPongUpdate > 30) {
-      lastPingPongUpdate = millis();
-      ballX += ballDirX * 2;
-      ballY += ballDirY * 2;
-      if (ballX <= 2 || ballX >= 126) ballDirX = -ballDirX;
-      if (ballY <= 2) ballDirY = -ballDirY;
-      if (ballY >= 58 && ballX > paddleX && ballX < paddleX + 20) ballDirY = -ballDirY;
-      if (ballY > 63) {
-        ballX = 64; ballY = 32; ballDirY = -1;
-        buzzAlert();
-      }
-      renderCurrentScreen();
-    }
-  }
-
-  // ===== Standby (only in Volume Mode) =====
+  // ===== Standby (only in Volume Mode and only if timer is active) =====
+  // Eyes will only blink if a timer is active (running/paused/completed)
+  bool timerActiveNow = (focusTimerRunning || timerPaused || timerCompleted);
   if (currentMode == MODE_VOLUME) {
-    if (!inStandby && millis() - lastActivity > STANDBY_TIMEOUT) {
+    if (!inStandby && millis() - lastActivity > STANDBY_TIMEOUT && timerActiveNow) {
       inStandby = true;
       fadeInEyes();
     }
-    if (inStandby && btn == LOW) {
-      inStandby = false;
-      fadeOutEyes();
-      lastOverlaySecond = -1;
-      renderCurrentScreen();
-      lastActivity = millis();
-    }
+    // waking handled at button-event top (so press will wake)
   }
 
   delay(2);
