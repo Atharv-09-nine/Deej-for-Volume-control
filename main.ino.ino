@@ -48,11 +48,17 @@ int clamp(int v){
 }
 
 void sendValues(){
+
   Serial.print(values[0]);
   Serial.print("|");
   Serial.print(values[1]);
   Serial.print("|");
-  Serial.println(values[2]);
+  Serial.print(values[2]);
+  Serial.print("|");
+  Serial.print(values[3]);
+  Serial.print("|");
+  Serial.println(values[4]);
+
 }
 
 void drawVolumeUI(){
@@ -183,7 +189,7 @@ void loop(){
 
     activeSlot++;
 
-    if(activeSlot >= 3)
+    if(activeSlot >= 5)
       activeSlot = 0;
 
     drawVolumeUI();
