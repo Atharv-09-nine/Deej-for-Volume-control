@@ -47,7 +47,7 @@ void loop() {
   int clkState = digitalRead(CLK_PIN);
   int dtState = digitalRead(DT_PIN);
 
-  if (clkState != lastClkState && clkState == LOW) {
+ if (clkState != lastClkState && clkState == LOW) {
 
     if (dtState == HIGH)
       values[activeSlot] += valuePerStep;
@@ -55,10 +55,6 @@ void loop() {
       values[activeSlot] -= valuePerStep;
 
     values[activeSlot] = clamp(values[activeSlot]);
-
-    Serial.print("Slot ");
-    Serial.print(activeSlot);
-    Serial.print(" -> ");
 
     sendValues();
   }
